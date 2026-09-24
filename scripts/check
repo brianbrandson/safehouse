@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+cleanup_pycache() {
+  python3 - <<'PY'
+from pathlib import Path
+import shutil
+
+for path in Path('.').rglob('__pycache__'):
+    shutil.rmtree(path, ignore_errors=True)
+for path in Path('.').rglob('*.pyc'):
+    path.unlink(missing_ok=True)
+PY
+}
+TMPDIR_SAFEHOUSE=""
+trap 'cleanup_pycache; [[ -z "$TMPDIR_SAFEHOUSE" ]] || rm -rf "$TMPDIR_SAFEHOUSE"' EXIT
+cleanup_pycache
+python3 -m py_compile safehouse.py tests/test_safehouse.py
+python3 -m unittest discover -s tests -v
+TMPDIR_SAFEHOUSE="$(mktemp -d)"
+printf '#!/usr/bin/env bash\necho "VeraCrypt 1.26.7"\n' >"$TMPDIR_SAFEHOUSE/veracrypt"
+printf '#!/usr/bin/env bash\necho "mke2fs 1.47.0"\n' >"$TMPDIR_SAFEHOUSE/mkfs.ext4"
+chmod 700 "$TMPDIR_SAFEHOUSE/veracrypt"
+chmod 700 "$TMPDIR_SAFEHOUSE/mkfs.ext4"
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py defaults set engagement --path "$TMPDIR_SAFEHOUSE/containers" >/tmp/safehouse-default-paths.out
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" SAFEHOUSE_VERACRYPT="$TMPDIR_SAFEHOUSE/veracrypt" SAFEHOUSE_MKFS_EXT4="$TMPDIR_SAFEHOUSE/mkfs.ext4" python3 safehouse.py doctor >/tmp/safehouse-doctor.out
+grep -q "OK veracrypt" /tmp/safehouse-doctor.out
+grep -q "OK mkfs.ext4" /tmp/safehouse-doctor.out
+grep -q "OK default lab.obsidian-profile minimal" /tmp/safehouse-doctor.out
+mkdir -p "$TMPDIR_SAFEHOUSE/profile-vault/.obsidian"
+printf '{"accentColor":"smoke-secret"}\n' >"$TMPDIR_SAFEHOUSE/profile-vault/.obsidian/app.json"
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py obsidian-profile import smoke --from "$TMPDIR_SAFEHOUSE/profile-vault" >/tmp/safehouse-profile-import.out
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py defaults set engagement --obsidian-profile smoke >/tmp/safehouse-profile-default.out
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" SAFEHOUSE_VERACRYPT="$TMPDIR_SAFEHOUSE/veracrypt" SAFEHOUSE_MKFS_EXT4="$TMPDIR_SAFEHOUSE/mkfs.ext4" python3 safehouse.py doctor >/tmp/safehouse-doctor-profile.out
+grep -q "OK default engagement.obsidian-profile smoke" /tmp/safehouse-doctor-profile.out
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" SAFEHOUSE_VERACRYPT="$TMPDIR_SAFEHOUSE/veracrypt" SAFEHOUSE_MKFS_EXT4="$TMPDIR_SAFEHOUSE/mkfs.ext4" python3 safehouse.py doctor --json >/tmp/safehouse-doctor-json.out
+grep -q '"exit_code": 0' /tmp/safehouse-doctor-json.out
+grep -q '"check": "default"' /tmp/safehouse-doctor-json.out
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py defaults set engagement --container-size 512M >/tmp/safehouse-defaults-set.out
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py defaults set lab --path "$TMPDIR_SAFEHOUSE/labs" >/tmp/safehouse-lab-dir.out
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py defaults show >/tmp/safehouse-defaults-show.out
+grep -q "container-size = 512M" /tmp/safehouse-defaults-show.out
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py defaults clear engagement --container-size >/tmp/safehouse-defaults-clear.out
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py new lab --dry-run "Smoke Lab Dry Run" >/tmp/safehouse-new-lab-dry-run.out
+grep -q "DRY-RUN safehouse new lab Smoke Lab Dry Run" /tmp/safehouse-new-lab-dry-run.out
+test ! -e "$TMPDIR_SAFEHOUSE/labs/smoke-lab-dry-run"
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py new lab --dry-run --json "Smoke Lab Json Dry Run" >/tmp/safehouse-new-lab-dry-run-json.out
+grep -q '"exit_code": 0' /tmp/safehouse-new-lab-dry-run-json.out
+grep -q '"storage": "plain"' /tmp/safehouse-new-lab-dry-run-json.out
+grep -q '"will_write": false' /tmp/safehouse-new-lab-dry-run-json.out
+test ! -e "$TMPDIR_SAFEHOUSE/labs/smoke-lab-json-dry-run"
+if grep -qi "password\|secret" /tmp/safehouse-new-lab-dry-run-json.out; then
+  echo "new dry-run json output should not mention password or secrets" >&2
+  exit 1
+fi
+mkdir -p "$TMPDIR_SAFEHOUSE/labs/conflict-lab"
+printf 'keep-me\n' >"$TMPDIR_SAFEHOUSE/labs/conflict-lab/notes.md"
+if SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py new lab --dry-run "Conflict Lab" >/tmp/safehouse-new-lab-conflict-dry-run.out; then
+  echo "expected conflicting lab dry-run to fail" >&2
+  exit 1
+fi
+grep -q "NEXT inspect or move the existing path manually" /tmp/safehouse-new-lab-conflict-dry-run.out
+grep -q "keep-me" "$TMPDIR_SAFEHOUSE/labs/conflict-lab/notes.md"
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py new lab "Smoke Lab" >/tmp/safehouse-smoke.out
+test -f "$TMPDIR_SAFEHOUSE/labs/smoke-lab/00_run.md"
+test -f "$TMPDIR_SAFEHOUSE/labs/smoke-lab/00_access.md"
+test ! -d "$TMPDIR_SAFEHOUSE/labs/smoke-lab/06_evidence"
+test ! -d "$TMPDIR_SAFEHOUSE/labs/smoke-lab/07_loot"
+grep -q "HH:mm — action summary" "$TMPDIR_SAFEHOUSE/labs/smoke-lab/_safehouse/templates/lab-log-entry.md"
+grep -q "YYYY-MM-DD HH:mm TZ — action summary" "$TMPDIR_SAFEHOUSE/labs/smoke-lab/_safehouse/templates/engagement-log-entry.md"
+grep -q "# Log" "$TMPDIR_SAFEHOUSE/labs/smoke-lab/00_run.md"
+if grep -q "# Handoff" "$TMPDIR_SAFEHOUSE/labs/smoke-lab/00_run.md"; then
+  echo "00_run.md should keep resume state in Current State, not duplicate a Handoff section" >&2
+  exit 1
+fi
+if grep -q "template:" "$TMPDIR_SAFEHOUSE/labs/smoke-lab/00_run.md"; then
+  echo "00_run.md should not record a selected template" >&2
+  exit 1
+fi
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" SAFEHOUSE_BACKEND=fake python3 safehouse.py new engagement --dry-run "Smoke Client Dry Run" >/tmp/safehouse-new-engagement-dry-run.out
+grep -q "Would prompt for VeraCrypt password: yes" /tmp/safehouse-new-engagement-dry-run.out
+if printf 'first-passphrase\nsecond-passphrase\n' | SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" SAFEHOUSE_BACKEND=fake python3 safehouse.py new engagement "Mismatch Client" >/tmp/safehouse-new-non-tty.out 2>/tmp/safehouse-new-non-tty.err; then
+  echo "expected non-interactive VeraCrypt input to fail" >&2
+  exit 1
+fi
+grep -q "interactive terminal" /tmp/safehouse-new-non-tty.err
+if grep -qi "first-passphrase\|second-passphrase" /tmp/safehouse-new-non-tty.out /tmp/safehouse-new-non-tty.err; then
+  echo "non-interactive refusal should not expose sensitive input" >&2
+  exit 1
+fi
+if [[ -d "$TMPDIR_SAFEHOUSE/containers" ]] && find "$TMPDIR_SAFEHOUSE/containers" -mindepth 1 -print -quit | grep -q .; then
+  echo "non-interactive refusal should not create containers" >&2
+  exit 1
+fi
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py list >/tmp/safehouse-list.out
+grep -q "Smoke Lab" /tmp/safehouse-list.out
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py list --json >/tmp/safehouse-list-json.out
+grep -q '"count": 1' /tmp/safehouse-list-json.out
+grep -q '"safehouse_id"' /tmp/safehouse-list-json.out
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py status >/tmp/safehouse-status.out
+grep -q "READY" /tmp/safehouse-status.out
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py status --json >/tmp/safehouse-status-json.out
+grep -q '"exit_code": 0' /tmp/safehouse-status-json.out
+python3 safehouse.py --help >/dev/null
+python3 safehouse.py --version | grep -Eq '^safehouse [0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9.-]+)?$'
+python3 safehouse.py new --help >/dev/null
+python3 safehouse.py resize --help >/dev/null
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py obsidian-profile show minimal | grep -q "Profile: minimal"
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py obsidian-profile verify minimal | grep -q "OK built-in profile available"
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py obsidian-profile apply minimal --yes-replace --to "$TMPDIR_SAFEHOUSE/labs/smoke-lab" >/tmp/safehouse-profile-smoke.out
+grep -q '"folder": "_safehouse/templates"' "$TMPDIR_SAFEHOUSE/labs/smoke-lab/.obsidian/templates.json"
+grep -q "Safehouse local snippet hook" "$TMPDIR_SAFEHOUSE/labs/smoke-lab/.obsidian/snippets/safehouse.css"
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py obsidian-profile verify --all | grep -q "OK built-in profile available"
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py obsidian-profile list --verbose | grep -q "minimal.*built-in.*available"
+if SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py vault-template list >/tmp/safehouse-retired-template.out 2>&1; then
+  echo "vault-template must remain retired" >&2
+  exit 1
+fi
+if SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py category list >/tmp/safehouse-retired-category.out 2>&1; then
+  echo "category must remain retired" >&2
+  exit 1
+fi
+if SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py obsidian-profile apply minimal "$TMPDIR_SAFEHOUSE/labs/smoke-lab" >/tmp/safehouse-retired-profile-target.out 2>&1; then
+  echo "positional obsidian-profile apply target must remain retired" >&2
+  exit 1
+fi
+python3 safehouse.py list --help >/dev/null
+python3 safehouse.py status --help >/dev/null
+python3 safehouse.py --help | grep -q "personal local operator tool"
+python3 safehouse.py new --help | grep -q "Prompts for VeraCrypt password"
+python3 safehouse.py mount --help >/dev/null
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" SAFEHOUSE_BACKEND=fake python3 safehouse.py unmount --help >/dev/null
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py remove "Smoke Lab" --dry-run >/tmp/safehouse-remove-dry-run.out
+grep -q "DRY-RUN safehouse remove Smoke Lab" /tmp/safehouse-remove-dry-run.out
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py remove "Smoke Lab" --yes >/tmp/safehouse-remove.out
+grep -q "removed" /tmp/safehouse-remove.out
+python3 safehouse.py remove --help >/dev/null
+echo "safehouse check passed"
