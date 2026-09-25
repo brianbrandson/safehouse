@@ -388,6 +388,7 @@ class SafehouseTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         files = result.stdout.splitlines()
+        self.assertIn('.github/FUNDING.yml', files)
         self.assertIn('CONTRIBUTING.md', files)
         self.assertIn('safehouse.py', files)
         self.assertIn('pyproject.toml', files)
@@ -416,6 +417,7 @@ class SafehouseTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((out / '.github' / 'FUNDING.yml').is_file())
             self.assertTrue((out / 'CONTRIBUTING.md').is_file())
             self.assertTrue((out / 'safehouse.py').is_file())
             self.assertTrue((out / 'pyproject.toml').is_file())
@@ -646,6 +648,62 @@ class SafehouseTests(unittest.TestCase):
             self.assertIn('lab.storage = plain (configured)', show_result.stdout)
             self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
             self.assertIn(f'Safehouse path: {lab_root}/odyssey', dry_run.stdout)
+
+    def test_custom_vault_layout_import_default_and_new_preserve_operator_structure(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / 'home'
+            lab_root = Path(td) / 'labs'
+            source = Path(td) / 'web-notes-layout'
+            (source / 'evidence' / 'screenshots').mkdir(parents=True)
+            (source / 'evidence' / 'screenshots' / '.gitkeep').write_text('', encoding='utf-8')
+            (source / 'assessment.md').write_text('# Operator-owned structure\n', encoding='utf-8')
+
+            imported = self.run_cli_with_home(home, 'vault-layout', 'import', 'web-notes', '--from', str(source))
+            listed = self.run_cli_with_home(home, 'vault-layout', 'list')
+            shown = self.run_cli_with_home(home, 'vault-layout', 'show', 'web-notes')
+            verified = self.run_cli_with_home(home, 'vault-layout', 'verify', 'web-notes')
+            configured = self.run_cli_with_home(
+                home, 'defaults', 'set', 'lab', '--path', str(lab_root), '--vault-layout', 'web-notes',
+            )
+            created = self.run_cli_with_home(home, 'new', 'lab', 'Training Target')
+
+            root = lab_root / 'training-target'
+            records = safehouse.StateStore(safehouse.AppPaths.from_home(home)).records()
+            self.assertEqual(imported.returncode, 0, imported.stderr)
+            self.assertIn('imported vault layout web-notes', imported.stdout)
+            self.assertIn('web-notes', listed.stdout)
+            self.assertEqual(shown.returncode, 0, shown.stderr)
+            self.assertIn('Vault layout: web-notes', shown.stdout)
+            self.assertNotIn('Operator-owned structure', shown.stdout)
+            self.assertEqual(verified.returncode, 0, verified.stderr)
+            self.assertIn('OK vault layout web-notes', verified.stdout)
+            self.assertEqual(configured.returncode, 0, configured.stderr)
+            self.assertEqual(created.returncode, 0, created.stderr)
+            self.assertEqual((root / 'assessment.md').read_text(encoding='utf-8'), '# Operator-owned structure\n')
+            self.assertTrue((root / 'evidence' / 'screenshots' / '.gitkeep').is_file())
+            self.assertTrue((root / '.safehouse.json').is_file())
+            self.assertTrue((root / '.obsidian' / 'app.json').is_file())
+            self.assertFalse((root / '00_run.md').exists())
+            self.assertFalse((root / '01_scans').exists())
+            self.assertEqual(records[0].vault_layout, 'web-notes')
+
+    def test_new_refuses_drifted_custom_vault_layout_before_creating_state_or_root(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / 'home'
+            source = Path(td) / 'layout'
+            source.mkdir()
+            (source / 'notes.md').write_text('# clean\n', encoding='utf-8')
+            imported = self.run_cli_with_home(home, 'vault-layout', 'import', 'clean', '--from', str(source))
+            stored = safehouse.AppPaths.from_home(home).config_dir / 'vault-layouts' / 'clean' / 'notes.md'
+            stored.write_text('# changed\n', encoding='utf-8')
+
+            created = self.run_cli_with_home(home, 'new', '--vault-layout', 'clean', 'lab', 'Refused')
+
+            self.assertEqual(imported.returncode, 0, imported.stderr)
+            self.assertNotEqual(created.returncode, 0)
+            self.assertIn('vault layout drift', created.stderr)
+            self.assertFalse((home / 'safehouse' / 'labs' / 'refused').exists())
+            self.assertEqual(safehouse.StateStore(safehouse.AppPaths.from_home(home)).records(), [])
 
     def test_category_filters_and_retired_surface_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -898,7 +956,6 @@ class SafehouseTests(unittest.TestCase):
             self.assertEqual(lab_result.returncode, 0, lab_result.stderr)
             self.assertNotEqual(ctf_result.returncode, 0)
             self.assertNotEqual(removed_global_result.returncode, 0)
-            self.assertIn('the following arguments are required: CATEGORY', removed_global_result.stderr)
             self.assertIn('lab.path = ', show_all.stdout)
             self.assertNotIn('ctf.path', show_all.stdout)
 

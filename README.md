@@ -1,6 +1,6 @@
 # Safehouse
 
-Safehouse is a local-first CLI that creates a structured Safehouse scaffold for pentest labs and manages VeraCrypt-backed engagement Safehouses. Its encrypted lifecycle is check, mount, work, unmount, check.
+Safehouse is a local-first CLI for clean pentest labs and VeraCrypt-backed engagement workspaces. It creates a consistent folder scaffold and keeps the normal encrypted workflow deliberately boring: check, mount, work, unmount, check.
 
 Status: alpha. Review its output before relying on it for client work.
 
@@ -14,11 +14,11 @@ safehouse --version
 safehouse doctor
 ```
 
-Encrypted Safehouses require VeraCrypt and `e2fsprogs` (`mkfs.ext4`). `safehouse doctor` checks both before you create one. Labs use plain storage by default and do not need VeraCrypt.
+Encrypted engagements require VeraCrypt and `e2fsprogs` (`mkfs.ext4`). `safehouse doctor` checks both before you create one. Labs do not need VeraCrypt.
 
 ## Quick start
 
-Labs use plain local folders by default and do not require VeraCrypt:
+Labs are plain local folders and do not require VeraCrypt:
 
 ```bash
 safehouse new lab --dry-run "PortSwigger SQLi"
@@ -42,6 +42,28 @@ safehouse mount "ACME External"
 safehouse unmount "ACME External"
 safehouse status
 ```
+
+## Vault layouts
+
+`safehouse` is the built-in default layout. It creates this starting tree:
+
+```text
+00_run.md        00_access.md      README.md
+01_scans/        02_notes/         03_leads/
+04_primitives/   05_findings/      08_reports/
+99_archive/      _safehouse/templates/
+```
+
+That is a default, not a requirement. A vault layout controls files and folders; an Obsidian profile controls editor settings and plugins. Import a sanitized reusable layout, then set it once per category or select it for one Safehouse:
+
+```bash
+safehouse vault-layout import web-notes --from "$HOME/safehouse-layouts/web-notes"
+safehouse vault-layout verify web-notes
+safehouse defaults set lab --vault-layout web-notes
+safehouse new engagement --vault-layout web-notes "Client Placeholder"
+```
+
+Safehouse copies imported layouts into its local host-side store before use. Keep those source layouts free of client notes, credentials, and engagement artifacts; encryption for a later engagement does not encrypt the stored layout snapshot.
 
 ## Safety model
 

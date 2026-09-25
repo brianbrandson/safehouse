@@ -112,8 +112,10 @@ grep -q '"folder": "_safehouse/templates"' "$TMPDIR_SAFEHOUSE/labs/smoke-lab/.ob
 grep -q "Safehouse local snippet hook" "$TMPDIR_SAFEHOUSE/labs/smoke-lab/.obsidian/snippets/safehouse.css"
 SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py obsidian-profile verify --all | grep -q "OK built-in profile available"
 SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py obsidian-profile list --verbose | grep -q "minimal.*built-in.*available"
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py vault-layout list | grep -q "safehouse"
+SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py vault-layout show safehouse | grep -q "Vault layout: safehouse"
 if SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py vault-template list >/tmp/safehouse-retired-template.out 2>&1; then
-  echo "vault-template must remain retired" >&2
+  echo "vault-template must remain retired; use vault-layout" >&2
   exit 1
 fi
 if SAFEHOUSE_HOME="$TMPDIR_SAFEHOUSE/home" python3 safehouse.py category list >/tmp/safehouse-retired-category.out 2>&1; then

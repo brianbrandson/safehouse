@@ -126,18 +126,23 @@ class ResizeResult:
 
 SAFEHOUSE_ID_RE = re.compile(r"^sh-[0-9a-f]{8}$")
 CATEGORIES = {"lab", "engagement"}
-CATEGORY_DEFAULT_FIELDS = {"path", "storage", "container-size", "obsidian-profile"}
+CATEGORY_DEFAULT_FIELDS = {"path", "storage", "container-size", "obsidian-profile", "vault-layout"}
 CATEGORY_DEFAULT_FLAG_DESTS = {
     "path": "path",
     "storage": "storage",
     "container_size": "container-size",
     "obsidian_profile": "obsidian-profile",
+    "vault_layout": "vault-layout",
 }
 STORAGE_MODES = {"plain", "encrypted"}
 SIZE_RE = re.compile(r"^[1-9][0-9]*[KMGTP]$")
 SIZE_UNITS = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4, "P": 1024**5}
 OBSIDIAN_IMPORT_MAX_FILES = 1000
 OBSIDIAN_IMPORT_MAX_BYTES = 50 * 1024 * 1024
+VAULT_LAYOUT_IMPORT_MAX_FILES = 1000
+VAULT_LAYOUT_IMPORT_MAX_BYTES = 50 * 1024 * 1024
+VAULT_LAYOUT_RESERVED_ROOTS = {".obsidian", "_safehouse", ".git", ".trash"}
+SAFEHOUSE_MARKER_NAME = ".safehouse.json"
 
 
 
@@ -178,6 +183,7 @@ STATE_ALLOWED_KEYS = {
     "phase",
     "created_at",
     "last_opened_at",
+    "vault_layout",
 }
 SECRET_FIELD_NAMES = {"password", "passphrase", "pim", "pin", "token", "secret", "keyfile"}
 
@@ -210,7 +216,7 @@ class ConfigStore:
 
     def builtin_category_defaults(self) -> dict[str, dict[str, str]]:
         base = self.home_root() / "safehouse"
-        common = {"container-size": "512M", "obsidian-profile": "minimal"}
+        common = {"container-size": "512M", "obsidian-profile": "minimal", "vault-layout": "safehouse"}
         return {
             "lab": {**common, "path": str(base / "labs"), "storage": "plain"},
             "engagement": {**common, "path": str(base / "engagements"), "storage": "encrypted"},
@@ -237,7 +243,7 @@ class ConfigStore:
     def effective_category_defaults(self, category: str) -> dict[str, str]:
         self._validate_category(category)
         base = self.home_root() / "safehouse"
-        effective = {"path": str(base / category), "storage": "encrypted", "container-size": "512M", "obsidian-profile": "minimal"}
+        effective = {"path": str(base / category), "storage": "encrypted", "container-size": "512M", "obsidian-profile": "minimal", "vault-layout": "safehouse"}
         effective.update(self.builtin_category_defaults().get(category, {}))
         effective.update(self.category_defaults(category))
         return effective
@@ -286,6 +292,10 @@ class ConfigStore:
             raise ValueError("container-size must look like 512M, 1G, or 2048M")
         if validate_value and field == "obsidian-profile":
             validate_profile_name(value)
+        if validate_value and field == "vault-layout":
+            validate_vault_layout_name(value)
+            if value != "safehouse" and not vault_layout_path(self.paths, value).is_dir():
+                raise ValueError(f"vault layout does not exist: {value}")
 
     def _validate_category(self, category: str) -> None:
         normalized = slug_name(category)
@@ -332,6 +342,7 @@ class SafehouseRecord:
     storage: str = "encrypted"
     created_at: str = ""
     last_opened_at: str = ""
+    vault_layout: str = "safehouse"
 
     def __post_init__(self) -> None:
         if not SAFEHOUSE_ID_RE.fullmatch(self.safehouse_id):
@@ -341,6 +352,7 @@ class SafehouseRecord:
             raise ValueError("storage must be plain or encrypted")
         if self.phase not in SAFEHOUSE_PHASES:
             raise ValueError(f"invalid safehouse phase: {self.phase}")
+        validate_vault_layout_name(self.vault_layout)
 
     def to_dict(self) -> dict[str, str]:
         return {
@@ -356,6 +368,7 @@ class SafehouseRecord:
             "phase": self.phase,
             "created_at": self.created_at,
             "last_opened_at": self.last_opened_at,
+            "vault_layout": self.vault_layout,
         }
 
     @classmethod
@@ -370,6 +383,8 @@ class SafehouseRecord:
         fields = {key: data.get(key, "") for key in STATE_ALLOWED_KEYS}
         if not fields.get("storage"):
             fields["storage"] = "plain" if not fields.get("container_path") else "encrypted"
+        if not fields.get("vault_layout"):
+            fields["vault_layout"] = "safehouse"
         return cls(**fields)
 
     def with_phase(self, phase: str) -> "SafehouseRecord":
@@ -470,7 +485,7 @@ def print_defaults(store: ConfigStore, category: str | None = None) -> None:
     for category_name in categories:
         category_configured = store.category_defaults(category_name)
         category_effective = store.effective_category_defaults(category_name)
-        for field in ("path", "storage", "container-size", "obsidian-profile"):
+        for field in ("path", "storage", "container-size", "obsidian-profile", "vault-layout"):
             source = "configured" if field in category_configured else "built-in"
             print(f"{category_name}.{field} = {category_effective[field]} ({source})")
 
@@ -491,6 +506,214 @@ def validate_profile_name(name: str) -> str:
     if normalized != name:
         raise ValueError("obsidian profile name must be a lowercase hyphen identifier")
     return normalized
+
+
+def validate_vault_layout_name(name: str) -> str:
+    normalized = slug_name(name)
+    if normalized != name:
+        raise ValueError("vault layout name must be a lowercase hyphen identifier")
+    return normalized
+
+
+def vault_layout_dir(paths: AppPaths) -> Path:
+    return paths.config_dir / "vault-layouts"
+
+
+def vault_layout_path(paths: AppPaths, name: str) -> Path:
+    return vault_layout_dir(paths) / validate_vault_layout_name(name)
+
+
+def vault_layout_manifest_path(paths: AppPaths, name: str) -> Path:
+    return vault_layout_dir(paths) / f"{validate_vault_layout_name(name)}.import-manifest.json"
+
+
+def _refuse_symlinked_layout_path(path: Path) -> None:
+    if path.is_symlink():
+        raise RuntimeError(f"refusing symlinked vault layout path: {path}")
+
+
+def vault_layout_source_dir(source: str) -> Path:
+    root = Path(source).expanduser()
+    if root.is_symlink():
+        raise RuntimeError(f"refusing symlinked vault layout source directory: {root}")
+    resolved = root.resolve()
+    if not resolved.is_dir():
+        raise RuntimeError(f"missing vault layout source directory: {resolved}")
+    return resolved
+
+
+def inspect_vault_layout_source(source_dir: Path) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    for item in sorted(source_dir.rglob("*")):
+        rel = item.relative_to(source_dir)
+        if not rel.parts or rel.parts[0] in VAULT_LAYOUT_RESERVED_ROOTS:
+            raise RuntimeError(f"refusing reserved vault layout path: {rel}")
+        if rel.is_absolute() or ".." in rel.parts:
+            raise RuntimeError(f"refusing unsafe vault layout path: {rel}")
+        if item.is_symlink():
+            raise RuntimeError(f"refusing symlink in vault layout source: {rel}")
+        if item.is_dir():
+            entries.append({"path": str(rel), "kind": "directory", "size": 0, "sha256": ""})
+            continue
+        if not item.is_file():
+            raise RuntimeError(f"refusing special file in vault layout source: {rel}")
+        data = item.read_bytes()
+        entries.append({"path": str(rel), "kind": "file", "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+    files = [entry for entry in entries if entry["kind"] == "file"]
+    if len(files) > VAULT_LAYOUT_IMPORT_MAX_FILES:
+        raise RuntimeError(f"vault layout import has too many files: {len(files)}")
+    total_bytes = sum(cast(int, entry["size"]) for entry in files)
+    if total_bytes > VAULT_LAYOUT_IMPORT_MAX_BYTES:
+        raise RuntimeError(f"vault layout import is too large: {total_bytes} bytes")
+    return entries
+
+
+def copy_imported_vault_layout(source_dir: Path, dest: Path, entries: list[dict[str, object]]) -> None:
+    for entry in entries:
+        rel = Path(cast(str, entry["path"]))
+        source = source_dir / rel
+        target = dest / rel
+        if source.is_symlink():
+            raise RuntimeError(f"refusing symlink in vault layout source: {rel}")
+        if entry["kind"] == "directory":
+            if not source.is_dir():
+                raise RuntimeError(f"vault layout source changed during import: {rel}")
+            target.mkdir(mode=0o700, parents=True, exist_ok=False)
+            continue
+        if not source.is_file():
+            raise RuntimeError(f"vault layout source changed during import: {rel}")
+        data = source.read_bytes()
+        if len(data) != entry["size"] or hashlib.sha256(data).hexdigest() != entry["sha256"]:
+            raise RuntimeError(f"vault layout source changed during import: {rel}")
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        target.write_bytes(data)
+        target.chmod(0o600)
+
+
+def write_vault_layout_manifest(paths: AppPaths, name: str, entries: list[dict[str, object]]) -> Path:
+    root = vault_layout_dir(paths)
+    _refuse_symlinked_layout_path(root)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    root.chmod(0o700)
+    target = vault_layout_manifest_path(paths, name)
+    _refuse_symlinked_layout_path(target)
+    payload = {"format": 1, "layout": validate_vault_layout_name(name), "entries": entries}
+    tmp = root / f".{validate_vault_layout_name(name)}.import-manifest.tmp"
+    _refuse_symlinked_layout_path(tmp)
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.chmod(0o600)
+    tmp.replace(target)
+    target.chmod(0o600)
+    return target
+
+
+def import_vault_layout(paths: AppPaths, name: str, source: str) -> Path:
+    name = validate_vault_layout_name(name)
+    root = vault_layout_dir(paths)
+    dest = vault_layout_path(paths, name)
+    manifest = vault_layout_manifest_path(paths, name)
+    for path in (root, dest, manifest):
+        _refuse_symlinked_layout_path(path)
+    if dest.exists() or manifest.exists():
+        raise RuntimeError(f"vault layout already exists: {name}")
+    source_dir = vault_layout_source_dir(source)
+    entries = inspect_vault_layout_source(source_dir)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    root.chmod(0o700)
+    tmp = root / f".{name}.tmp"
+    _refuse_symlinked_layout_path(tmp)
+    if tmp.exists():
+        raise RuntimeError(f"refusing existing temporary vault layout path: {tmp}")
+    tmp.mkdir(mode=0o700)
+    try:
+        copy_imported_vault_layout(source_dir, tmp, entries)
+        tmp.replace(dest)
+        write_vault_layout_manifest(paths, name, entries)
+    except Exception:
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        if dest.exists() and not manifest.exists():
+            shutil.rmtree(dest)
+        raise
+    return dest
+
+
+def list_vault_layouts(paths: AppPaths) -> list[str]:
+    root = vault_layout_dir(paths)
+    _refuse_symlinked_layout_path(root)
+    if not root.is_dir():
+        return []
+    return sorted(path.name for path in root.iterdir() if path.is_dir() and not path.name.startswith("."))
+
+
+def load_vault_layout_manifest(paths: AppPaths, name: str) -> dict[str, object]:
+    manifest_path = vault_layout_manifest_path(paths, name)
+    _refuse_symlinked_layout_path(manifest_path)
+    if not manifest_path.is_file():
+        raise RuntimeError(f"missing vault layout manifest: {name}")
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid vault layout manifest: {name}") from exc
+    if not isinstance(payload, dict) or payload.get("format") != 1 or payload.get("layout") != name:
+        raise RuntimeError(f"invalid vault layout manifest: {name}")
+    if not isinstance(payload.get("entries"), list):
+        raise RuntimeError(f"invalid vault layout manifest: {name}")
+    return cast(dict[str, object], payload)
+
+
+def verify_vault_layout(paths: AppPaths, name: str) -> tuple[int, list[str]]:
+    name = validate_vault_layout_name(name)
+    if name == "safehouse":
+        return 0, ["OK vault layout safehouse (built-in)"]
+    root = vault_layout_path(paths, name)
+    _refuse_symlinked_layout_path(root)
+    if not root.is_dir():
+        return 2, [f"WARN vault layout missing: {name}"]
+    manifest = load_vault_layout_manifest(paths, name)
+    expected = cast(list[dict[str, object]], manifest["entries"])
+    try:
+        actual = inspect_vault_layout_source(root)
+    except RuntimeError as exc:
+        return 2, [f"WARN vault layout drift: {name}: {exc}"]
+    if actual != expected:
+        return 2, [f"WARN vault layout drift: {name}"]
+    return 0, [f"OK vault layout {name}"]
+
+
+def require_verified_vault_layout(paths: AppPaths, name: str) -> str:
+    name = validate_vault_layout_name(name)
+    exit_code, lines = verify_vault_layout(paths, name)
+    if exit_code:
+        raise RuntimeError(lines[0].removeprefix("WARN "))
+    return name
+
+
+def vault_layout_list_lines(paths: AppPaths) -> list[str]:
+    layouts = list_vault_layouts(paths)
+    lines = ["Built-in vault layouts:", "  safehouse    Safehouse default folders and starter notes", "Imported vault layouts:"]
+    lines.extend(f"  {name}" for name in layouts) if layouts else lines.append("  (none)")
+    return lines
+
+
+def show_vault_layout(paths: AppPaths, name: str) -> list[str]:
+    name = validate_vault_layout_name(name)
+    if name == "safehouse":
+        return ["Vault layout: safehouse", "Source: built-in", "Structure: Safehouse default folders and starter notes"]
+    manifest = load_vault_layout_manifest(paths, name)
+    entries = cast(list[dict[str, object]], manifest["entries"])
+    files = [entry for entry in entries if entry["kind"] == "file"]
+    directories = [entry for entry in entries if entry["kind"] == "directory"]
+    total_bytes = sum(cast(int, entry["size"]) for entry in files)
+    exit_code, _lines = verify_vault_layout(paths, name)
+    return [
+        f"Vault layout: {name}",
+        "Source: imported snapshot",
+        f"Directories: {len(directories)}",
+        f"Files: {len(files)}",
+        f"Bytes: {total_bytes}",
+        f"Verification: {'OK' if exit_code == 0 else 'DRIFTED'}",
+    ]
 
 
 def obsidian_source_dir(source: str) -> Path:
@@ -1365,6 +1588,7 @@ def record_for_paths(
     filesystem: str,
     phase: str,
     storage: str = "encrypted",
+    vault_layout: str = "safehouse",
 ) -> SafehouseRecord:
     now = dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
     return SafehouseRecord(
@@ -1380,6 +1604,7 @@ def record_for_paths(
         phase=phase,
         created_at=now,
         last_opened_at="",
+        vault_layout=vault_layout,
     )
 
 
@@ -1531,6 +1756,7 @@ Examples:
     new.add_argument("--storage", choices=sorted(STORAGE_MODES), metavar="MODE", help="one-time storage mode for this Safehouse; does not change defaults")
     new.add_argument("--container-size", metavar="SIZE", help="one-time encrypted container size, such as 512M or 2G; does not change defaults")
     new.add_argument("--obsidian-profile", metavar="PROFILE", help="one-time Obsidian profile for this Safehouse; does not change defaults")
+    new.add_argument("--vault-layout", metavar="LAYOUT", help="one-time vault layout for this Safehouse; does not change defaults")
     new.add_argument("category", choices=sorted(CATEGORIES), help="Safehouse category")
     new.add_argument("name", help="display name stored in local state; filesystem artifacts use opaque IDs")
     defaults = sub.add_parser(
@@ -1546,6 +1772,7 @@ Available settings:
   CATEGORY.storage          storage mode for future Safehouses
   CATEGORY.container-size   size for future encrypted containers, such as 512M or 2G
   CATEGORY.obsidian-profile Obsidian profile copied into each new Safehouse
+  CATEGORY.vault-layout     built-in safehouse layout or imported vault layout for future Safehouses
 
 Examples:
   safehouse defaults show
@@ -1573,17 +1800,19 @@ Examples:
   safehouse defaults clear lab --obsidian-profile
   safehouse defaults clear --all""",
     )
-    defaults_set.add_argument("category", choices=sorted(CATEGORIES), metavar="CATEGORY", help="lab or engagement category to configure")
+    defaults_set.add_argument("category", nargs="?", choices=sorted(CATEGORIES), metavar="CATEGORY", help="lab or engagement category to configure")
     defaults_set.add_argument("--path", metavar="PATH", help="set root path for future Safehouses in CATEGORY")
     defaults_set.add_argument("--storage", choices=sorted(STORAGE_MODES), metavar="MODE", help="set storage mode for future Safehouses in CATEGORY")
     defaults_set.add_argument("--container-size", metavar="SIZE", help="set size for future encrypted containers, such as 512M or 2G")
     defaults_set.add_argument("--obsidian-profile", metavar="PROFILE", help="set Obsidian profile copied into each new Safehouse")
+    defaults_set.add_argument("--vault-layout", metavar="LAYOUT", help="set built-in safehouse or imported vault layout for each new Safehouse")
     defaults_clear = defaults_sub.add_parser("clear", help="revert category settings, or all settings with --all, to built-in defaults")
     defaults_clear.add_argument("target", nargs="?", choices=sorted(CATEGORIES), metavar="CATEGORY", help="lab or engagement category to revert when used with field flags")
     defaults_clear.add_argument("--path", action="store_true", help="clear the category path override")
     defaults_clear.add_argument("--storage", action="store_true", help="clear the category storage override")
     defaults_clear.add_argument("--container-size", action="store_true", help="clear the category container-size override")
     defaults_clear.add_argument("--obsidian-profile", action="store_true", help="clear the category obsidian-profile override")
+    defaults_clear.add_argument("--vault-layout", action="store_true", help="clear the category vault-layout override")
     defaults_clear.add_argument("--all", action="store_true", help="revert all configured settings to built-in defaults")
     profile = sub.add_parser(
         "obsidian-profile",
@@ -1678,6 +1907,31 @@ New Safehouses get the configured default profile automatically. Replacing an ex
     profile_apply.add_argument("--yes-replace", action="store_true", help="confirm replacement of an existing .obsidian directory")
     profile_apply.add_argument("name", help="profile name")
     profile_apply.add_argument("--to", dest="to_target", required=True, help="registered Safehouse root that should receive .obsidian/")
+
+    layout = sub.add_parser(
+        "vault-layout",
+        help="manage local reusable vault layouts",
+        formatter_class=SafehouseHelpFormatter,
+        description="Store sanitized vault folder/note layouts for future Safehouses; layouts are separate from Obsidian profiles.",
+        epilog="""A vault layout controls vault files and folders. An Obsidian profile controls editor settings and plugins.
+Imported layouts are copied snapshots stored under ~/.config/safehouse/vault-layouts/ and are not encrypted there.
+Use only sanitized reusable material: never import client notes, credentials, or engagement artifacts.
+
+Examples:
+  safehouse vault-layout import web-notes --from /path/to/sanitized-layout
+  safehouse vault-layout verify web-notes
+  safehouse defaults set lab --vault-layout web-notes
+  safehouse new engagement --vault-layout web-notes 'Client Placeholder'""",
+    )
+    layout_sub = layout.add_subparsers(dest="vault_layout_cmd", required=True)
+    layout_import = layout_sub.add_parser("import", help="store a named snapshot from a sanitized layout directory")
+    layout_import.add_argument("name", help="new layout name")
+    layout_import.add_argument("--from", dest="source", required=True, help="sanitized layout directory")
+    layout_sub.add_parser("list", help="list built-in and imported vault layouts")
+    layout_show = layout_sub.add_parser("show", help="show a safe layout summary without file contents")
+    layout_show.add_argument("name", help="layout name, including built-in safehouse")
+    layout_verify = layout_sub.add_parser("verify", help="verify an imported layout snapshot before use")
+    layout_verify.add_argument("name", help="layout name, including built-in safehouse")
 
     list_cmd = sub.add_parser(
         "list",
@@ -1855,6 +2109,29 @@ def scaffold_safehouse_root(root: Path, category: str, name: str) -> Path:
     return root
 
 
+def write_safehouse_marker(root: Path, safehouse_id: str) -> Path:
+    marker = root / SAFEHOUSE_MARKER_NAME
+    if marker.exists():
+        raise RuntimeError(f"refusing to overwrite Safehouse marker: {marker}")
+    marker.write_text(json.dumps({"format": 1, "safehouse_id": safehouse_id}, sort_keys=True) + "\n", encoding="utf-8")
+    marker.chmod(0o600)
+    return marker
+
+
+def materialize_safehouse_root(root: Path, category: str, name: str, safehouse_id: str, vault_layout: str, paths: AppPaths) -> Path:
+    if vault_layout == "safehouse":
+        scaffold_safehouse_root(root, category, name)
+    else:
+        if not scaffold_root_is_available(root):
+            raise SystemExit(f"Refusing to write into non-empty directory: {root}")
+        layout = require_verified_vault_layout(paths, vault_layout)
+        manifest = load_vault_layout_manifest(paths, layout)
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        copy_imported_vault_layout(vault_layout_path(paths, layout), root, cast(list[dict[str, object]], manifest["entries"]))
+    write_safehouse_marker(root, safehouse_id)
+    return root
+
+
 def backend_from_env() -> Any:
     if os.environ.get("SAFEHOUSE_BACKEND") == "fake":
         return FakeVeraCryptBackend()
@@ -1978,8 +2255,25 @@ def path_has_safehouse_scaffold(path: Path) -> bool:
     return (path / "00_run.md").is_file() and (path / "00_access.md").is_file()
 
 
-def encrypted_mount_present(path: Path) -> bool:
-    return path.is_dir() and (os.path.ismount(path) or path_has_safehouse_scaffold(path))
+def path_has_safehouse_marker(path: Path, safehouse_id: str) -> bool:
+    marker = path / SAFEHOUSE_MARKER_NAME
+    if marker.is_symlink() or not marker.is_file():
+        return False
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and payload.get("format") == 1 and payload.get("safehouse_id") == safehouse_id
+
+
+def path_has_safehouse_content(path: Path, safehouse_id: str | None = None) -> bool:
+    if safehouse_id and path_has_safehouse_marker(path, safehouse_id):
+        return True
+    return path_has_safehouse_scaffold(path)
+
+
+def encrypted_mount_present(path: Path, safehouse_id: str | None = None) -> bool:
+    return path.is_dir() and (os.path.ismount(path) or path_has_safehouse_content(path, safehouse_id))
 
 
 def live_mount_matches(path: Path, live_mounts: dict[Path, Path] | None, container_path: Path | None = None) -> bool:
@@ -1990,24 +2284,24 @@ def live_mount_matches(path: Path, live_mounts: dict[Path, Path] | None, contain
     return path in live_mounts.values()
 
 
-def mount_path_state(path: Path, live_mounts: dict[Path, Path] | None = None, container_path: Path | None = None) -> str:
+def mount_path_state(path: Path, live_mounts: dict[Path, Path] | None = None, container_path: Path | None = None, safehouse_id: str | None = None) -> str:
     if live_mount_matches(path, live_mounts, container_path):
         return "known_mounted"
     if not path.exists():
         return "absent"
     if not path.is_dir():
         return "blocked"
-    if live_mounts is not None and path_has_safehouse_scaffold(path):
+    if live_mounts is not None and path_has_safehouse_content(path, safehouse_id):
         return "stale_scaffold"
-    if encrypted_mount_present(path):
+    if encrypted_mount_present(path, safehouse_id):
         return "known_mounted"
     if any(path.iterdir()):
         return "blocked"
     return "empty"
 
 
-def ensure_mount_path_available(path: Path, live_mounts: dict[Path, Path] | None = None, container_path: Path | None = None) -> None:
-    state = mount_path_state(path, live_mounts=live_mounts, container_path=container_path)
+def ensure_mount_path_available(path: Path, live_mounts: dict[Path, Path] | None = None, container_path: Path | None = None, safehouse_id: str | None = None) -> None:
+    state = mount_path_state(path, live_mounts=live_mounts, container_path=container_path, safehouse_id=safehouse_id)
     if state in {"absent", "empty"}:
         return
     if state == "known_mounted":
@@ -2045,7 +2339,7 @@ def status_for_record(record: SafehouseRecord, live_mounts: dict[Path, Path] | N
     container_path = Path(record.container_path) if record.container_path else Path("")
     if not container_path.is_file():
         return StatusLine("NEEDS_RECOVERY", record, str(safehouse_path), f"{record.safehouse_id} missing container: {container_path}")
-    mount_state = mount_path_state(safehouse_path, live_mounts=live_mounts, container_path=container_path)
+    mount_state = mount_path_state(safehouse_path, live_mounts=live_mounts, container_path=container_path, safehouse_id=record.safehouse_id)
     if mount_state == "known_mounted":
         return StatusLine("MOUNTED", record, str(safehouse_path))
     if mount_state == "blocked":
@@ -2163,7 +2457,7 @@ def preflight_remove_safehouse(state: StateStore, backend: Any, selector: str) -
     if not container_path.is_file():
         raise RuntimeError(f"missing Safehouse container for {record.safehouse_id}: {container_path}")
     live_mounts = live_mounts_from_backend(backend)
-    mount_state = mount_path_state(safehouse_path, live_mounts=live_mounts, container_path=container_path)
+    mount_state = mount_path_state(safehouse_path, live_mounts=live_mounts, container_path=container_path, safehouse_id=record.safehouse_id)
     if mount_state in {"known_mounted", "stale_scaffold"}:
         raise RuntimeError(f"Safehouse is mounted or has a stale mount view; unmount it before removal: {safehouse_path}")
     if mount_state == "blocked":
@@ -2262,7 +2556,7 @@ def preflight_mount_safehouse(
         raise RuntimeError(f"missing container for {record.safehouse_id}: {container_path}")
     if live_mounts is None:
         live_mounts = live_mounts_from_backend(backend)
-    ensure_mount_path_available(mount_path, live_mounts=live_mounts, container_path=container_path)
+    ensure_mount_path_available(mount_path, live_mounts=live_mounts, container_path=container_path, safehouse_id=record.safehouse_id)
     return record
 
 
@@ -2278,18 +2572,20 @@ def create_safehouse(
     storage_override: str | None = None,
     container_size: str | None = None,
     obsidian_profile: str | None = None,
+    vault_layout: str | None = None,
 ) -> SafehousePaths:
     storage = storage_mode_for(config, category, storage_override=storage_override)
     safehouse_id = new_safehouse_id(id_rng)
     profile = obsidian_profile or config.get_category_default(category, "obsidian-profile") or "minimal"
+    layout = require_verified_vault_layout(config.paths, vault_layout or config.get_category_default(category, "vault-layout") or "safehouse")
     if profile != "minimal" and not profile_path(config.paths, profile).is_dir():
         raise RuntimeError(f"obsidian profile does not exist: {profile}")
     if storage == "plain":
         paths = plain_safehouse_paths(config, category, name, safehouse_id, path=path)
-        record = record_for_paths(paths, category, "", "", "creating", storage=storage)
+        record = record_for_paths(paths, category, "", "", "creating", storage=storage, vault_layout=layout)
         state.upsert(record)
         try:
-            scaffold_safehouse_root(paths.mount_path, category, name)
+            materialize_safehouse_root(paths.mount_path, category, name, safehouse_id, layout, config.paths)
             record = record.with_phase("scaffolded")
             state.upsert(record)
             apply_obsidian_profile(config.paths, profile, str(paths.mount_path))
@@ -2308,7 +2604,7 @@ def create_safehouse(
         raise ValueError("container-size must look like 512M, 1G, or 2048M")
     filesystem = "ext4"
     paths = derive_safehouse_paths(roots, name, safehouse_id=safehouse_id)
-    record = record_for_paths(paths, category, size, filesystem, "creating", storage=storage)
+    record = record_for_paths(paths, category, size, filesystem, "creating", storage=storage, vault_layout=layout)
     if paths.container_path.exists():
         raise RuntimeError(f"refusing to overwrite existing container: {paths.container_path}")
     ensure_mount_path_available(paths.mount_path)
@@ -2320,7 +2616,7 @@ def create_safehouse(
         backend.mount_volume(paths.container_path, paths.mount_path, password=password)
         record = record.with_phase("mounted")
         state.upsert(record)
-        scaffold_safehouse_root(paths.mount_path, category, name)
+        materialize_safehouse_root(paths.mount_path, category, name, safehouse_id, layout, config.paths)
         record = record.with_phase("scaffolded")
         state.upsert(record)
         apply_obsidian_profile(config.paths, profile, str(paths.mount_path))
@@ -2478,11 +2774,13 @@ def dry_run_new_safehouse(
     storage_override: str | None = None,
     container_size: str | None = None,
     obsidian_profile: str | None = None,
+    vault_layout: str | None = None,
 ) -> tuple[int, list[str]]:
     manual_recovery = "NEXT inspect or move the existing path manually before running without --dry-run"
     storage = storage_mode_for(config, category, storage_override=storage_override)
     safehouse_id = new_safehouse_id(id_rng)
     profile = obsidian_profile or config.get_category_default(category, "obsidian-profile") or "minimal"
+    layout = require_verified_vault_layout(paths, vault_layout or config.get_category_default(category, "vault-layout") or "safehouse")
     if profile != "minimal" and not profile_path(paths, profile).is_dir():
         raise RuntimeError(f"obsidian profile does not exist: {profile}")
     if storage == "plain":
@@ -2493,6 +2791,7 @@ def dry_run_new_safehouse(
             "Storage: plain",
             f"Safehouse path: {planned.mount_path}",
             f"Obsidian profile: {profile}",
+            f"Vault layout: {layout}",
             "Would prompt for VeraCrypt password: no",
             f"Would create scaffold: {planned.mount_path}",
             f"Would apply obsidian profile {profile} to {planned.mount_path / '.obsidian'}",
@@ -2519,6 +2818,7 @@ def dry_run_new_safehouse(
         f"Size: {size}",
         f"Filesystem: {filesystem}",
         f"Obsidian profile: {profile}",
+        f"Vault layout: {layout}",
         "Would prompt for VeraCrypt password: yes",
         "Would create VeraCrypt container",
         "Would mount VeraCrypt container",
@@ -2544,10 +2844,12 @@ def json_new_plan(
     storage_override: str | None = None,
     container_size: str | None = None,
     obsidian_profile: str | None = None,
+    vault_layout: str | None = None,
 ) -> dict[str, Any]:
     storage = storage_mode_for(config, category, storage_override=storage_override)
     safehouse_id = new_safehouse_id(id_rng)
     profile = obsidian_profile or config.get_category_default(category, "obsidian-profile") or "minimal"
+    layout = require_verified_vault_layout(paths, vault_layout or config.get_category_default(category, "vault-layout") or "safehouse")
     if profile != "minimal" and not profile_path(paths, profile).is_dir():
         raise RuntimeError(f"obsidian profile does not exist: {profile}")
     payload: dict[str, Any] = {
@@ -2562,6 +2864,7 @@ def json_new_plan(
         "size": "",
         "filesystem": "",
         "obsidian_profile": profile,
+        "vault_layout": layout,
         "will_prompt": storage == "encrypted",
         "will_write": False,
         "steps": [],
@@ -2825,6 +3128,29 @@ def main(argv: list[str] | None = None) -> int:
         except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
             parser.exit(2, f"safehouse: error: {exc}\n")
 
+    if args.cmd == "vault-layout":
+        try:
+            if args.vault_layout_cmd == "import":
+                copied = import_vault_layout(paths, args.name, args.source)
+                print(f"imported vault layout {args.name} {copied}")
+                print("warning: imported layouts are host-side local snapshots; use sanitized reusable material only")
+                return 0
+            if args.vault_layout_cmd == "list":
+                for line in vault_layout_list_lines(paths):
+                    print(line)
+                return 0
+            if args.vault_layout_cmd == "show":
+                for line in show_vault_layout(paths, args.name):
+                    print(line)
+                return 0
+            if args.vault_layout_cmd == "verify":
+                exit_code, lines = verify_vault_layout(paths, args.name)
+                for line in lines:
+                    print(line)
+                return exit_code
+        except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            parser.exit(2, f"safehouse: error: {exc}\n")
+
     if args.cmd == "defaults":
         store = ConfigStore(paths)
         try:
@@ -2833,7 +3159,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.defaults_cmd == "set":
                 category_updates = category_default_updates_from_args(args)
-                if (args.path is not None or args.storage is not None or args.container_size is not None or args.obsidian_profile is not None) and not args.category:
+                if (args.path is not None or args.storage is not None or args.container_size is not None or args.obsidian_profile is not None or args.vault_layout is not None) and not args.category:
                     raise ValueError("defaults set requires CATEGORY")
                 if not category_updates:
                     raise ValueError("defaults set requires at least one setting flag")
@@ -2984,6 +3310,7 @@ def main(argv: list[str] | None = None) -> int:
                         storage_override=args.storage,
                         container_size=args.container_size,
                         obsidian_profile=args.obsidian_profile,
+                        vault_layout=args.vault_layout,
                     )
                     print(json.dumps(payload, indent=2, sort_keys=True))
                     return cast(int, payload["exit_code"])
@@ -2996,6 +3323,7 @@ def main(argv: list[str] | None = None) -> int:
                     storage_override=args.storage,
                     container_size=args.container_size,
                     obsidian_profile=args.obsidian_profile,
+                    vault_layout=args.vault_layout,
                 )
                 for line in lines:
                     print(line)
@@ -3015,6 +3343,7 @@ def main(argv: list[str] | None = None) -> int:
                 storage_override=args.storage,
                 container_size=args.container_size,
                 obsidian_profile=args.obsidian_profile,
+                vault_layout=args.vault_layout,
             )
         except KeyboardInterrupt:
             parser.exit(130, "safehouse: interrupted\n")

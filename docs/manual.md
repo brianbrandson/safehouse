@@ -1,6 +1,6 @@
 # Safehouse manual
 
-Safehouse creates local Safehouses for pentest work. Labs default to plain folders; engagements default to VeraCrypt containers.
+Safehouse creates local pentest workspaces. Labs are plain folders; engagements use VeraCrypt containers.
 
 ## Install
 
@@ -29,7 +29,7 @@ safehouse new engagement --dry-run "Client Safe Name"
 safehouse new engagement "Client Safe Name"
 ```
 
-Labs use plain storage by default and do not require VeraCrypt. Creating an encrypted Safehouse prompts for a VeraCrypt password and leaves the new Safehouse mounted when creation succeeds.
+Labs do not use VeraCrypt. Creating an engagement prompts for a VeraCrypt password and leaves the new Safehouse mounted when creation succeeds.
 
 For one engagement outside the usual location, use a one-time path without changing your saved defaults:
 
@@ -61,6 +61,7 @@ Safehouse works without setup. Its built-in defaults are:
 - engagements: `~/safehouse/engagements`, encrypted storage
 - encrypted container size: `512M`
 - Obsidian profile: `minimal`
+- vault layout: `safehouse`
 
 Change defaults with `safehouse defaults set`:
 
@@ -81,6 +82,27 @@ safehouse defaults clear lab --path
 safehouse defaults clear lab --obsidian-profile
 safehouse defaults clear --all
 ```
+
+## Use a vault layout
+
+The built-in `safehouse` layout is the default. It creates `00_run.md`, `00_access.md`, `README.md`, the numbered work folders, and `_safehouse/templates/`.
+
+It is not compulsory. A vault layout controls the initial files and folders; an Obsidian profile controls editor settings and plugins. To use your own structure, make a deliberately sanitized layout directory, import it as a local snapshot, inspect it, and then choose it as a category default or a one-time creation override:
+
+```bash
+safehouse vault-layout import web-notes --from "$HOME/safehouse-layouts/web-notes"
+safehouse vault-layout list
+safehouse vault-layout show web-notes
+safehouse vault-layout verify web-notes
+
+safehouse defaults set lab --vault-layout web-notes
+safehouse new lab "Practice Web App"
+safehouse new engagement --vault-layout web-notes "Client Placeholder"
+```
+
+Imported layouts may have any ordinary file/folder structure. Safehouse copies a custom layout as-is, then adds only a small internal Safehouse marker and the selected Obsidian profile; it does not add the built-in folders, starter notes, `.gitkeep` files, or templates.
+
+Import rejects symlinks, special files, and `.obsidian`, `_safehouse`, `.git`, and `.trash` content. Layout snapshots live under `~/.config/safehouse/vault-layouts/` and are not encrypted merely because a later engagement Safehouse is encrypted. Import only reusable material with no client notes, passwords, tokens, or engagement artifacts.
 
 ## Use an Obsidian profile
 
@@ -138,7 +160,7 @@ Encrypted Safehouses must be closed first. Safehouse refuses mounted, stale, sym
 
 ## Safety notes
 
-- Safehouse creates local files and folders. For encrypted storage, it invokes local VeraCrypt to create and mount containers.
+- Safehouse only creates local files and folders.
 - It refuses non-empty target folders and unknown/external mount paths.
 - There is no `--force`; inspect and move/delete paths manually when needed.
 - Use encrypted engagement Safehouses for real engagement material unless ROE says otherwise.
